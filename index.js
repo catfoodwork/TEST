@@ -31,47 +31,48 @@ app.post("/hubspot/action", async (req, res) => {
 
     // Fetch all company properties from HubSpot
     const hsRes = await axios.get(
-      `https://api.hubapi.com/crm/v3/objects/companies/${companyId}?associations=contacts`,
+      `https://api.hubapi.com/crm/v3/objects/companies/${companyId}`,
       {
         headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` },
         params: {
           properties: [
             "name","domain","industry","annualrevenue","numberofemployees",
-            "city","state","country","phone","description","hs_lead_status",
-            "lifecyclestage","createdate","notes_last_updated"
+            "city","state","country","phone","description"
           ].join(","),
         },
       }
     );
 
-    const company = hsRes.data;
-    const props = company.properties;
-
+    const props = hsRes.data.properties;
     console.log(`✅ Fetched company: ${props.name}`);
 
-    // Build prompt for Manus
-    const prompt = `You are analyzing a HubSpot company record. Here is the company data:
+    // Build prompt — ask Manus to find manager and return structured JSON
+    const prompt = `You are a research assistant helping a sales team find contact information.
 
-Company Name: ${props.name || "N/A"}
-Domain: ${props.domain || "N/A"}
-Industry: ${props.industry || "N/A"}
-Annual Revenue: ${props.annualrevenue || "N/A"}
-Number of Employees: ${props.numberofemployees || "N/A"}
-City: ${props.city || "N/A"}
-State: ${props.state || "N/A"}
-Country: ${props.country || "N/A"}
-Phone: ${props.phone || "N/A"}
-Description: ${props.description || "N/A"}
-Lead Status: ${props.hs_lead_status || "N/A"}
-Lifecycle Stage: ${props.lifecyclestage || "N/A"}
+Research the following company and find the name, job title, email address, phone number, and LinkedIn URL of the most senior decision maker (CEO, MD, Owner, Director, or equivalent).
 
-Please analyze this company and provide:
-1. A brief company summary (2-3 sentences)
-2. Key opportunities or insights based on the data
-3. Recommended next actions for the sales team
-4. Any data gaps that should be filled in
+Company details:
+- Name: ${props.name || "N/A"}
+- Website: ${props.domain || "N/A"}
+- Industry: ${props.industry || "N/A"}
+- Location: ${[props.city, props.state, props.country].filter(Boolean).join(", ") || "N/A"}
+- Employees: ${props.numberofemployees || "N/A"}
 
-Keep the response concise and actionable for a sales team.`;
+Search the web, LinkedIn, the company website, and any other public sources to find the most accurate and up-to-date contact information.
+
+You MUST respond with ONLY a valid JSON object in this exact format — no extra text, no markdown, no explanation:
+{
+  "first_name": "",
+  "last_name": "",
+  "job_title": "",
+  "email": "",
+  "phone": "",
+  "linkedin_url": "",
+  "confidence": "high|medium|low",
+  "source": "where you found this info"
+}
+
+If you cannot find a field, leave it as an empty string. Do not guess email addresses.`;
 
     // Create Manus task
     const manusRes = await axios.post(
@@ -96,16 +97,13 @@ Keep the response concise and actionable for a sales team.`;
 
     // Respond to HubSpot immediately
     res.status(200).json({
-      outputFields: {
-        status: "processing",
-        manusTaskId,
-      },
+      outputFields: { status: "processing", manusTaskId },
     });
 
-    // Also create a note in HubSpot that the task has started
+    // Create a note that research has started
     await createHubSpotNote(
       companyId,
-      `🤖 Manus AI analysis started (Task ID: ${manusTaskId}). Results will be added shortly.`
+      `🔍 Manus AI is researching the key decision maker for this company. A contact will be created and associated shortly.`
     );
 
   } catch (err) {
@@ -135,26 +133,55 @@ app.post("/manus/webhook", async (req, res) => {
       return res.status(200).json({ received: true });
     }
 
-    const message = task_detail?.message || "No response from Manus.";
-    const stopReason = task_detail?.stop_reason;
+    const message = task_detail?.message || "";
+    console.log(`✅ Manus task ${taskId} completed for company ${companyId}`);
+    console.log(`📄 Manus response: ${message}`);
 
-    console.log(`✅ Manus task ${taskId} stopped (${stopReason}) for company ${companyId}`);
+    // Parse the JSON contact info from Manus response
+    let contact = null;
+    try {
+      const cleaned = message.replace(/```json|```/g, "").trim();
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        contact = JSON.parse(jsonMatch[0]);
+      }
+    } catch (parseErr) {
+      console.error("❌ Failed to parse Manus JSON response:", parseErr.message);
+    }
 
-    // Create a HubSpot note with Manus results
-    await createHubSpotNote(
-      companyId,
-      `🤖 Manus AI Analysis Complete:\n\n${message}`
-    );
+    if (!contact || (!contact.first_name && !contact.last_name)) {
+      await createHubSpotNote(
+        companyId,
+        `🤖 Manus AI could not find a verified decision maker contact for this company.\n\nManus response:\n${message}`
+      );
+      delete taskMap[taskId];
+      return res.status(200).json({ received: true });
+    }
 
-    // Update the company record with a custom property (if you have one set up)
-    // Uncomment and adjust property name if needed:
-    // await updateHubSpotCompany(companyId, {
-    //   manus_last_analysis: message.substring(0, 500),
-    // });
+    console.log(`👤 Found contact: ${contact.first_name} ${contact.last_name} (${contact.job_title})`);
 
-    // Clean up task map
+    // Create the contact in HubSpot
+    const contactId = await createHubSpotContact(contact);
+
+    if (contactId) {
+      // Associate the contact with the company
+      await associateContactWithCompany(contactId, companyId);
+
+      // Create a summary note on the company
+      await createHubSpotNote(
+        companyId,
+        `✅ Manus AI found and created a contact:\n\n👤 ${contact.first_name} ${contact.last_name}\n💼 ${contact.job_title || "N/A"}\n📧 ${contact.email || "N/A"}\n📞 ${contact.phone || "N/A"}\n🔗 ${contact.linkedin_url || "N/A"}\n\n📊 Confidence: ${contact.confidence || "N/A"}\n🔍 Source: ${contact.source || "N/A"}`
+      );
+
+      console.log(`✅ Contact ${contactId} created and associated with company ${companyId}`);
+    } else {
+      await createHubSpotNote(
+        companyId,
+        `⚠️ Manus found contact info but failed to create it in HubSpot:\n\n${JSON.stringify(contact, null, 2)}`
+      );
+    }
+
     delete taskMap[taskId];
-
     res.status(200).json({ received: true });
 
   } catch (err) {
@@ -164,11 +191,77 @@ app.post("/manus/webhook", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// Helper: Create a HubSpot contact
+// ─────────────────────────────────────────────
+async function createHubSpotContact(contact) {
+  try {
+    const properties = {
+      firstname: contact.first_name || "",
+      lastname: contact.last_name || "",
+      jobtitle: contact.job_title || "",
+      ...(contact.email && { email: contact.email }),
+      ...(contact.phone && { phone: contact.phone }),
+      ...(contact.linkedin_url && { hs_linkedin_url: contact.linkedin_url }),
+    };
+
+    const res = await axios.post(
+      "https://api.hubapi.com/crm/v3/objects/contacts",
+      { properties },
+      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+    );
+
+    console.log(`📇 HubSpot contact created: ${res.data.id}`);
+    return res.data.id;
+  } catch (err) {
+    // If contact already exists (409), find and return existing ID
+    if (err.response?.status === 409 && contact.email) {
+      console.log("⚠️ Contact already exists, fetching existing...");
+      try {
+        const searchRes = await axios.post(
+          "https://api.hubapi.com/crm/v3/objects/contacts/search",
+          {
+            filterGroups: [{
+              filters: [{
+                propertyName: "email",
+                operator: "EQ",
+                value: contact.email,
+              }]
+            }]
+          },
+          { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+        );
+        return searchRes.data.results?.[0]?.id || null;
+      } catch (searchErr) {
+        console.error("❌ Failed to find existing contact:", searchErr.message);
+        return null;
+      }
+    }
+    console.error("❌ Failed to create contact:", err.response?.data || err.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────
+// Helper: Associate contact with company
+// ─────────────────────────────────────────────
+async function associateContactWithCompany(contactId, companyId) {
+  try {
+    await axios.put(
+      `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/companies/${companyId}/contact_to_company`,
+      {},
+      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+    );
+    console.log(`🔗 Contact ${contactId} associated with company ${companyId}`);
+  } catch (err) {
+    console.error("❌ Failed to associate contact:", err.response?.data || err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
 // Helper: Create a HubSpot note on a company
 // ─────────────────────────────────────────────
 async function createHubSpotNote(companyId, body) {
   try {
-    // Create the note engagement
     const noteRes = await axios.post(
       "https://api.hubapi.com/crm/v3/objects/notes",
       {
@@ -182,28 +275,16 @@ async function createHubSpotNote(companyId, body) {
 
     const noteId = noteRes.data.id;
 
-    // Associate note with the company
     await axios.put(
       `https://api.hubapi.com/crm/v4/objects/notes/${noteId}/associations/companies/${companyId}/note_to_company`,
       {},
       { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
     );
 
-    console.log(`📝 Note created and associated with company ${companyId}`);
+    console.log(`📝 Note created on company ${companyId}`);
   } catch (err) {
-    console.error("❌ Failed to create HubSpot note:", err.response?.data || err.message);
+    console.error("❌ Failed to create note:", err.response?.data || err.message);
   }
-}
-
-// ─────────────────────────────────────────────
-// Helper: Update HubSpot company properties
-// ─────────────────────────────────────────────
-async function updateHubSpotCompany(companyId, properties) {
-  await axios.patch(
-    `https://api.hubapi.com/crm/v3/objects/companies/${companyId}`,
-    { properties },
-    { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
-  );
 }
 
 // Health check
