@@ -10,7 +10,19 @@ const MANUS_API_KEY = ((process.env.MANUS_API_KEY_1 || "") + (process.env.MANUS_
 const PORT = process.env.PORT || 3000;
 
 // Store active tasks: manusTaskId -> hubspot companyId
-const taskMap = {};
+// Use a file-based store so it survives container restarts
+const TASK_MAP_FILE = '/tmp/taskmap.json';
+function loadTaskMap() {
+  try {
+    const fs2 = require('fs');
+    if (fs2.existsSync(TASK_MAP_FILE)) return JSON.parse(fs2.readFileSync(TASK_MAP_FILE, 'utf8'));
+  } catch(e) {}
+  return {};
+}
+function saveTaskMap(map) {
+  try { require('fs').writeFileSync(TASK_MAP_FILE, JSON.stringify(map)); } catch(e) {}
+}
+const taskMap = loadTaskMap();
 
 // ─────────────────────────────────────────────
 // 1. HubSpot Custom Action triggers this endpoint
@@ -96,6 +108,7 @@ If you cannot find a field, leave it as an empty string. Do not guess email addr
 
     // Store mapping
     taskMap[manusTaskId] = companyId;
+    saveTaskMap(taskMap);
 
     // Respond to HubSpot immediately
     res.status(200).json({
@@ -184,6 +197,7 @@ app.post("/manus/webhook", async (req, res) => {
     }
 
     delete taskMap[taskId];
+    saveTaskMap(taskMap);
     res.status(200).json({ received: true });
 
   } catch (err) {
@@ -249,7 +263,7 @@ async function createHubSpotContact(contact) {
 async function associateContactWithCompany(contactId, companyId) {
   try {
     await axios.put(
-      `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/companies/${companyId}/contact_to_company`,
+      `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/companies/${companyId}`,
       {},
       { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
     );
@@ -278,7 +292,7 @@ async function createHubSpotNote(companyId, body) {
     const noteId = noteRes.data.id;
 
     await axios.put(
-      `https://api.hubapi.com/crm/v4/objects/notes/${noteId}/associations/companies/${companyId}/note_to_company`,
+      `https://api.hubapi.com/crm/v4/objects/notes/${noteId}/associations/companies/${companyId}`,
       {},
       { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
     );
