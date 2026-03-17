@@ -45,6 +45,7 @@ app.post("/hubspot/action", async (req, res) => {
 
     const props = hsRes.data.properties;
     console.log(`✅ Fetched company: ${props.name}`);
+    console.log(`🔑 Manus key length: ${MANUS_API_KEY.length}, preview: ${MANUS_API_KEY.substring(0,15)}`);
 
     // Build prompt — ask Manus to find manager and return structured JSON
     const prompt = `You are a research assistant helping a sales team find contact information.
@@ -84,6 +85,7 @@ If you cannot find a field, leave it as an empty string. Do not guess email addr
       {
         headers: {
           Authorization: `Bearer ${MANUS_API_KEY}`,
+          "API_KEY": MANUS_API_KEY,
           "Content-Type": "application/json",
         },
       }
