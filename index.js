@@ -1,5 +1,6 @@
 const express = require("express");
 const axios = require("axios");
+const fs = require("fs");
 require("dotenv").config();
 
 const app = express();
@@ -9,48 +10,38 @@ const HUBSPOT_TOKEN = (process.env.HUBSPOT_TOKEN || "").replace(/\s+/g, "");
 const MANUS_API_KEY = ((process.env.MANUS_API_KEY_1 || "") + (process.env.MANUS_API_KEY_2 || "")).replace(/\s+/g, "");
 const PORT = process.env.PORT || 3000;
 
-// Store active tasks: manusTaskId -> hubspot companyId
-// Use a file-based store so it survives container restarts
-const TASK_MAP_FILE = '/tmp/taskmap.json';
+// Persist taskMap to file so it survives container restarts
+const TASK_MAP_FILE = "/tmp/taskmap.json";
 function loadTaskMap() {
-  try {
-    const fs2 = require('fs');
-    if (fs2.existsSync(TASK_MAP_FILE)) return JSON.parse(fs2.readFileSync(TASK_MAP_FILE, 'utf8'));
-  } catch(e) {}
+  try { if (fs.existsSync(TASK_MAP_FILE)) return JSON.parse(fs.readFileSync(TASK_MAP_FILE, "utf8")); } catch(e) {}
   return {};
 }
 function saveTaskMap(map) {
-  try { require('fs').writeFileSync(TASK_MAP_FILE, JSON.stringify(map)); } catch(e) {}
+  try { fs.writeFileSync(TASK_MAP_FILE, JSON.stringify(map)); } catch(e) {}
 }
 const taskMap = loadTaskMap();
 
 // ─────────────────────────────────────────────
-// 1. HubSpot Custom Action triggers this endpoint
+// 1. HubSpot workflow triggers this
 // ─────────────────────────────────────────────
 app.post("/hubspot/action", async (req, res) => {
   try {
-    console.log("📥 HubSpot action triggered:", JSON.stringify(req.body));
+    console.log("📥 HubSpot action triggered");
 
     const companyId =
       req.body?.object?.objectId ||
       req.body?.inputFields?.companyId ||
       req.body?.companyId;
 
-    if (!companyId) {
-      console.error("No companyId found in payload:", req.body);
-      return res.status(400).json({ error: "No companyId found" });
-    }
+    if (!companyId) return res.status(400).json({ error: "No companyId found" });
 
-    // Fetch all company properties from HubSpot
+    // Fetch company properties
     const hsRes = await axios.get(
       `https://api.hubapi.com/crm/v3/objects/companies/${companyId}`,
       {
         headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` },
         params: {
-          properties: [
-            "name","domain","industry","annualrevenue","numberofemployees",
-            "city","state","country","phone","description"
-          ].join(","),
+          properties: ["name","domain","industry","numberofemployees","city","state","country"].join(","),
         },
       }
     );
@@ -59,10 +50,9 @@ app.post("/hubspot/action", async (req, res) => {
     console.log(`✅ Fetched company: ${props.name}`);
     console.log(`🔑 Manus key length: ${MANUS_API_KEY.length}, preview: ${MANUS_API_KEY.substring(0,15)}`);
 
-    // Build prompt — ask Manus to find manager and return structured JSON
     const prompt = `You are a research assistant helping a sales team find contact information.
 
-Research the following company and find the name, job title, email address, phone number, and LinkedIn URL of the most senior decision maker (CEO, MD, Owner, Director, or equivalent).
+Research the following company and find the most senior decision maker (CEO, MD, Owner, Director, or equivalent).
 
 Company details:
 - Name: ${props.name || "N/A"}
@@ -71,9 +61,9 @@ Company details:
 - Location: ${[props.city, props.state, props.country].filter(Boolean).join(", ") || "N/A"}
 - Employees: ${props.numberofemployees || "N/A"}
 
-Search the web, LinkedIn, the company website, and any other public sources to find the most accurate and up-to-date contact information.
+Search the web, LinkedIn, and the company website to find their contact information.
 
-You MUST respond with ONLY a valid JSON object in this exact format — no extra text, no markdown, no explanation:
+You MUST respond with ONLY a valid JSON object — no extra text, no markdown:
 {
   "first_name": "",
   "last_name": "",
@@ -82,18 +72,12 @@ You MUST respond with ONLY a valid JSON object in this exact format — no extra
   "phone": "",
   "linkedin_url": "",
   "confidence": "high|medium|low",
-  "source": "where you found this info"
-}
+  "source": "where you found this"
+}`;
 
-If you cannot find a field, leave it as an empty string. Do not guess email addresses.`;
-
-    // Create Manus task
     const manusRes = await axios.post(
       "https://api.manus.im/v1/tasks",
-      {
-        prompt,
-        webhook_url: `${process.env.BASE_URL}/manus/webhook`,
-      },
+      { prompt, webhook_url: `${process.env.BASE_URL}/manus/webhook` },
       {
         headers: {
           Authorization: `Bearer ${MANUS_API_KEY}`,
@@ -106,20 +90,10 @@ If you cannot find a field, leave it as an empty string. Do not guess email addr
     const manusTaskId = manusRes.data?.task_id || manusRes.data?.id;
     console.log(`🚀 Manus task created: ${manusTaskId}`);
 
-    // Store mapping
     taskMap[manusTaskId] = companyId;
     saveTaskMap(taskMap);
 
-    // Respond to HubSpot immediately
-    res.status(200).json({
-      outputFields: { status: "processing", manusTaskId },
-    });
-
-    // Create a note that research has started
-    await createHubSpotNote(
-      companyId,
-      `🔍 Manus AI is researching the key decision maker for this company. A contact will be created and associated shortly.`
-    );
+    res.status(200).json({ outputFields: { status: "processing", manusTaskId } });
 
   } catch (err) {
     console.error("❌ Error in /hubspot/action:", err.response?.data || err.message);
@@ -128,7 +102,7 @@ If you cannot find a field, leave it as an empty string. Do not guess email addr
 });
 
 // ─────────────────────────────────────────────
-// 2. Manus fires this webhook when task completes
+// 2. Manus webhook — fires when task completes
 // ─────────────────────────────────────────────
 app.post("/manus/webhook", async (req, res) => {
   try {
@@ -137,63 +111,41 @@ app.post("/manus/webhook", async (req, res) => {
     const { event_type, task_detail } = req.body;
     const taskId = task_detail?.task_id;
 
-    // Only act on task completion
-    if (event_type !== "task_stopped") {
-      return res.status(200).json({ received: true });
-    }
+    if (event_type !== "task_stopped") return res.status(200).json({ received: true });
 
     const companyId = taskMap[taskId];
     if (!companyId) {
-      console.warn(`⚠️ No company found for Manus task ${taskId}`);
+      console.warn(`⚠️ No company found for task ${taskId}`);
       return res.status(200).json({ received: true });
     }
 
     const message = task_detail?.message || "";
-    console.log(`✅ Manus task ${taskId} completed for company ${companyId}`);
     console.log(`📄 Manus response: ${message}`);
 
-    // Parse the JSON contact info from Manus response
+    // Parse JSON contact from Manus
     let contact = null;
     try {
       const cleaned = message.replace(/```json|```/g, "").trim();
       const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        contact = JSON.parse(jsonMatch[0]);
-      }
-    } catch (parseErr) {
-      console.error("❌ Failed to parse Manus JSON response:", parseErr.message);
+      if (jsonMatch) contact = JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      console.error("❌ Failed to parse contact JSON:", e.message);
     }
 
     if (!contact || (!contact.first_name && !contact.last_name)) {
-      await createHubSpotNote(
-        companyId,
-        `🤖 Manus AI could not find a verified decision maker contact for this company.\n\nManus response:\n${message}`
-      );
+      console.warn("⚠️ No valid contact found in Manus response");
       delete taskMap[taskId];
+      saveTaskMap(taskMap);
       return res.status(200).json({ received: true });
     }
 
-    console.log(`👤 Found contact: ${contact.first_name} ${contact.last_name} (${contact.job_title})`);
+    console.log(`👤 Found: ${contact.first_name} ${contact.last_name} (${contact.job_title})`);
 
-    // Create the contact in HubSpot
+    // Create contact in HubSpot
     const contactId = await createHubSpotContact(contact);
-
     if (contactId) {
-      // Associate the contact with the company
       await associateContactWithCompany(contactId, companyId);
-
-      // Create a summary note on the company
-      await createHubSpotNote(
-        companyId,
-        `✅ Manus AI found and created a contact:\n\n👤 ${contact.first_name} ${contact.last_name}\n💼 ${contact.job_title || "N/A"}\n📧 ${contact.email || "N/A"}\n📞 ${contact.phone || "N/A"}\n🔗 ${contact.linkedin_url || "N/A"}\n\n📊 Confidence: ${contact.confidence || "N/A"}\n🔍 Source: ${contact.source || "N/A"}`
-      );
-
-      console.log(`✅ Contact ${contactId} created and associated with company ${companyId}`);
-    } else {
-      await createHubSpotNote(
-        companyId,
-        `⚠️ Manus found contact info but failed to create it in HubSpot:\n\n${JSON.stringify(contact, null, 2)}`
-      );
+      console.log(`✅ Done! Contact ${contactId} linked to company ${companyId}`);
     }
 
     delete taskMap[taskId];
@@ -207,7 +159,7 @@ app.post("/manus/webhook", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// Helper: Create a HubSpot contact
+// Create HubSpot contact
 // ─────────────────────────────────────────────
 async function createHubSpotContact(contact) {
   try {
@@ -225,32 +177,19 @@ async function createHubSpotContact(contact) {
       { properties },
       { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
     );
-
-    console.log(`📇 HubSpot contact created: ${res.data.id}`);
+    console.log(`📇 Contact created: ${res.data.id}`);
     return res.data.id;
   } catch (err) {
-    // If contact already exists (409), find and return existing ID
     if (err.response?.status === 409 && contact.email) {
-      console.log("⚠️ Contact already exists, fetching existing...");
+      console.log("⚠️ Contact exists, finding ID...");
       try {
-        const searchRes = await axios.post(
+        const s = await axios.post(
           "https://api.hubapi.com/crm/v3/objects/contacts/search",
-          {
-            filterGroups: [{
-              filters: [{
-                propertyName: "email",
-                operator: "EQ",
-                value: contact.email,
-              }]
-            }]
-          },
+          { filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: contact.email }] }] },
           { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
         );
-        return searchRes.data.results?.[0]?.id || null;
-      } catch (searchErr) {
-        console.error("❌ Failed to find existing contact:", searchErr.message);
-        return null;
-      }
+        return s.data.results?.[0]?.id || null;
+      } catch(e) { return null; }
     }
     console.error("❌ Failed to create contact:", err.response?.data || err.message);
     return null;
@@ -258,52 +197,20 @@ async function createHubSpotContact(contact) {
 }
 
 // ─────────────────────────────────────────────
-// Helper: Associate contact with company
+// Associate contact with company
 // ─────────────────────────────────────────────
 async function associateContactWithCompany(contactId, companyId) {
   try {
     await axios.put(
       `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/companies/${companyId}`,
-      {},
-      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+      [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 279 }],
+      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" } }
     );
-    console.log(`🔗 Contact ${contactId} associated with company ${companyId}`);
+    console.log(`🔗 Contact ${contactId} linked to company ${companyId}`);
   } catch (err) {
-    console.error("❌ Failed to associate contact:", err.response?.data || err.message);
+    console.error("❌ Failed to associate:", err.response?.data || err.message);
   }
 }
 
-// ─────────────────────────────────────────────
-// Helper: Create a HubSpot note on a company
-// ─────────────────────────────────────────────
-async function createHubSpotNote(companyId, body) {
-  try {
-    const noteRes = await axios.post(
-      "https://api.hubapi.com/crm/v3/objects/notes",
-      {
-        properties: {
-          hs_note_body: body,
-          hs_timestamp: Date.now().toString(),
-        },
-      },
-      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
-    );
-
-    const noteId = noteRes.data.id;
-
-    await axios.put(
-      `https://api.hubapi.com/crm/v4/objects/notes/${noteId}/associations/companies/${companyId}`,
-      {},
-      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
-    );
-
-    console.log(`📝 Note created on company ${companyId}`);
-  } catch (err) {
-    console.error("❌ Failed to create note:", err.response?.data || err.message);
-  }
-}
-
-// Health check
-app.get("/", (req, res) => res.json({ status: "ok", message: "HubSpot-Manus bridge running" }));
-
+app.get("/", (req, res) => res.json({ status: "ok" }));
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
