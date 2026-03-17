@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 
 const HUBSPOT_TOKEN = (process.env.HUBSPOT_TOKEN || "").replace(/\s+/g, "");
-const MANUS_API_KEY = (process.env.MANUS_API_KEY || "").replace(/\s+/g, "");
+const MANUS_API_KEY = ((process.env.MANUS_API_KEY_1 || "") + (process.env.MANUS_API_KEY_2 || "")).replace(/\s+/g, "");
 const PORT = process.env.PORT || 3000;
 
 // Store active tasks: manusTaskId -> hubspot companyId
