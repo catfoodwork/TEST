@@ -92,7 +92,24 @@ async function pollManusTask(taskId, companyId) {
 async function processManusResult(taskId, companyId, message) {
   let contact = null;
   try {
-    const cleaned = message.replace(/```json|```/g, "").trim();
+    // Manus returns array of message blocks — extract the last assistant text
+    let text = message;
+    if (typeof message === "string" && message.trim().startsWith("[")) {
+      try {
+        const blocks = JSON.parse(message);
+        for (let i = blocks.length - 1; i >= 0; i--) {
+          const b = blocks[i];
+          if (b.role === "assistant" && Array.isArray(b.content)) {
+            const tb = b.content.find(c => c.type === "output_text" || c.type === "text");
+            if (tb) { text = tb.text; break; }
+          }
+          if (b.type === "output_text" || b.type === "text") { text = b.text || b.content; break; }
+        }
+      } catch(e2) { /* keep original */ }
+    }
+    console.log("🔍 Parsing text:", typeof text === "string" ? text.substring(0, 200) : JSON.stringify(text).substring(0, 200));
+    const str = typeof text === "string" ? text : JSON.stringify(text);
+    const cleaned = str.replace(/```json|```/g, "").trim();
     const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
     if (jsonMatch) contact = JSON.parse(jsonMatch[0]);
   } catch (e) {
